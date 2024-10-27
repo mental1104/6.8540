@@ -58,7 +58,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 
 
 func is_expired(now int64, timestamp int64) bool {
-	expire_time := 1000
+	expire_time := 10
 	ret := ((now - timestamp) > int64(expire_time))
     return ret
 }
@@ -142,12 +142,10 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 		reply.TaskName = file_name
 		reply.NReduce = c.NReduce
 		reply.TaskId = c.MapTasks[file_name].TaskId
-		fmt.Printf("map task allocated, [%s]\n", file_name)
 		return nil
 	} else if !c.isAllMapTaskCompleted() {
 		// 如果没有map任务可分配，且map任务没有全部执行完毕，则worker侧需要等待
 		reply.MsgType = Wait
-		fmt.Println("No map task allocated, wait")
 		return nil
 	}
 
@@ -173,7 +171,37 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 
 // 服务端rpc接口，用于给客户端报告任务状态
 func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error {
-	fmt.Printf("Call NoticeResult, req is %+v\n", req)
+	if req.MsgType == MapSuccess {
+		c.MapMutex.Lock()
+		for _, taskInfo := range c.MapTasks {
+			if req.TaskId == taskInfo.TaskId {
+				taskInfo.Status = finished
+				break
+			}
+		}
+		c.MapMutex.Unlock()
+	} else if req.MsgType == MapFailed {
+		c.MapMutex.Lock()
+		for _, taskInfo := range c.MapTasks {
+			if req.TaskId == taskInfo.TaskId {
+				taskInfo.Status = failed
+				break
+			}
+		}
+		c.MapMutex.Unlock()
+	} else if req.MsgType == ReduceSuccess {
+		c.ReduceMutex.Lock()
+		if req.TaskId >= 0 && req.TaskId < len(c.ReduceTasks) {
+			c.ReduceTasks[req.TaskId].Status = finished
+		}
+		c.ReduceMutex.Unlock()
+	} else if req.MsgType == ReduceFailed {
+		c.ReduceMutex.Lock()
+		if req.TaskId >= 0 && req.TaskId < len(c.ReduceTasks) {
+			c.ReduceTasks[req.TaskId].Status = failed
+		}
+		c.ReduceMutex.Unlock()
+	}
 	return nil
 }
 
@@ -198,12 +226,11 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	if c.isAllMapTaskCompleted() && c.isAllReduceTaskCompleted() {
+		return true
+	} else {
+		return false
+	}
 }
 
 func (c *Coordinator) initTask(files []string) {
@@ -219,8 +246,7 @@ func (c *Coordinator) initTask(files []string) {
 			Status: idle,
 		}
 	}
-	fmt.Printf("Init task success, %d reduce tasks\n", len(c.ReduceTasks))
-} 
+	fmt.Printf("Init task success, %d reduce tasks\n", len(c.ReduceTasks)) } 
 
 //
 // create a Coordinator.

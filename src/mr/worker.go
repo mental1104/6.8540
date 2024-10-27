@@ -5,7 +5,14 @@ import "time"
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
+import "os"
+import "encoding/json"
+import "regexp"
+import "path/filepath"
+import "io"
+import "sort"
+import "strconv"
+import "io/ioutil"
 
 //
 // Map functions return a slice of KeyValue.
@@ -14,6 +21,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -78,9 +93,212 @@ func CallForReportStatus(successType MsgType, taskID int) bool {
 	}
 
 	ret := call("Coordinator.NoticeResult", &args, nil)
-
 	return ret
 }
+
+func DelFileByMapId(targetNumber int, path string) error {
+	// 创建正则表达式，X 是可变的指定数字
+	pattern := fmt.Sprintf(`^mr-out-%d-\d+$`, targetNumber)
+	regex, err := regexp.Compile(pattern)
+	if err != nil {
+		return err
+	}
+
+	// 读取当前目录中的文件
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	// 遍历文件，查找匹配的文件
+	for _, file := range files {
+		if file.IsDir() {
+			continue // 跳过目录
+		}
+		fileName := file.Name()
+		if regex.MatchString(fileName) {
+			// 匹配到了文件，删除它
+			filePath := filepath.Join(path, file.Name())
+			err := os.Remove(filePath)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+
+func HandleMapTask(reply *MessageReply, mapf func(string, string) []KeyValue) error {
+	file, err := os.Open(reply.TaskName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return err
+	}
+
+	kva := mapf(reply.TaskName, string(content))
+	sort.Sort(ByKey(kva))
+
+	tempFiles := make([]*os.File, reply.NReduce)
+	encoders := make([]*json.Encoder, reply.NReduce)
+
+	for _, kv := range kva {
+		redId := ihash(kv.Key) % reply.NReduce
+		if encoders[redId] == nil {
+			tempFile, err := ioutil.TempFile("", fmt.Sprintf("mr-map-tmp-%d", redId))
+			if err != nil {
+				return err
+			}
+			defer tempFile.Close()
+			tempFiles[redId] = tempFile
+			encoders[redId] = json.NewEncoder(tempFile)
+		}
+		err := encoders[redId].Encode(&kv)
+		if err != nil {
+			return err
+		}
+	}
+
+	for i, file := range tempFiles {
+		if file != nil {
+			fileName := file.Name()
+			file.Close()
+			newName := fmt.Sprintf("mr-out-%d-%d", reply.TaskId, i)
+			if err := os.Rename(fileName, newName); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+
+func DelFileByReduceId(targetNumber int, path string) error {
+	// 创建正则表达式，X 是可变的指定数字
+	pattern := fmt.Sprintf(`^mr-out-\d+-%d$`, targetNumber)
+	regex, err := regexp.Compile(pattern)
+	if err != nil {
+		return err
+	}
+
+	// 读取当前目录中的文件
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	// 遍历文件，查找匹配的文件
+	for _, file := range files {
+		if file.IsDir() {
+			continue // 跳过目录
+		}
+		fileName := file.Name()
+		if regex.MatchString(fileName) {
+			// 匹配到了文件，删除它
+			filePath := filepath.Join(path, file.Name())
+			err := os.Remove(filePath)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+
+func ReadSpecificFile(targetNumber int, path string) (fileList []*os.File, err error) {
+	pattern := fmt.Sprintf(`^mr-out-\d+-%d$`, targetNumber)
+	regex, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	// 读取当前目录中的文件
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// 遍历文件，查找匹配的文件
+	for _, fileEntry := range files {
+		if fileEntry.IsDir() {
+			continue // 跳过目录
+		}
+		fileName := fileEntry.Name()
+		if regex.MatchString(fileName) {
+			filePath := filepath.Join(path, fileEntry.Name())
+			file, err := os.Open(filePath)
+			if err != nil {
+				log.Fatalf("cannot open %v", filePath)
+				for _, oFile := range fileList {
+					oFile.Close()
+				}
+				return nil, err
+			}
+			fileList = append(fileList, file)
+		}
+	}
+	return fileList, nil
+}
+
+
+func HandleReduceTask(reply *MessageReply, reducef func(string, []string) string) error {
+	key_id := reply.TaskId
+
+	k_vs := map[string][]string{}
+
+	fileList, err := ReadSpecificFile(key_id, "./")
+
+	if err != nil {
+		return err
+	}
+
+	// 整理所有的中间文件
+	for _, file := range fileList {
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			k_vs[kv.Key] = append(k_vs[kv.Key], kv.Value)
+		}
+		file.Close()
+	}
+
+	// 获取所有的键并排序
+	var keys []string
+	for k := range k_vs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	oname := "mr-out-" + strconv.Itoa(reply.TaskId)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		return err
+	}
+	defer ofile.Close()
+
+	for _, key := range keys {
+		output := reducef(key, k_vs[key])
+		_, err := fmt.Fprintf(ofile, "%v %v\n", key, output)
+		if err != nil {
+			return err
+		}
+	}
+
+	DelFileByReduceId(reply.TaskId, "./")
+	return nil
+}
+
+
 //
 // main/mrworker.go calls this function.
 //
@@ -88,7 +306,6 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	for {
-		time.Sleep(1 * time.Second)
 		replyMsg := CallForTasks()
 		if replyMsg == nil {
 			fmt.Println("reply failed!, continue")
@@ -97,19 +314,29 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		switch replyMsg.MsgType {
 		case MapTaskAlloc:
-			fmt.Println("MapTaskAlloc")
+			fmt.Printf("MapTaskAlloc %d\n", replyMsg.TaskId)
+			err := HandleMapTask(replyMsg, mapf)
+			if err == nil {
+                CallForReportStatus(MapSuccess, replyMsg.TaskId)
+			} else {
+				CallForReportStatus(MapFailed, replyMsg.TaskId)
+			}
 		case ReduceTaskAlloc:
-			fmt.Println("ReduceTaskAlloc")
-		case Shutdown:
-			fmt.Println("Task completed, Shutdown")
+			fmt.Printf("ReduceTaskAlloc: %d\n", replyMsg.TaskId)
+			err := HandleReduceTask(replyMsg, reducef)
+			if err == nil {
+                CallForReportStatus(ReduceSuccess, replyMsg.TaskId)
+			} else {
+				CallForReportStatus(ReduceFailed, replyMsg.TaskId)
+			}
 		case Wait:
-			fmt.Println("Task blocked, wait")
-		default:
-			fmt.Printf("Not yet supported type: %d\n", replyMsg.MsgType)
-			time.Sleep(1 * time.Second)
+			fmt.Println("No task at hand, wait")
+			time.Sleep(10 * time.Second)
+		case Shutdown:
+			fmt.Println("All Tasks well done, exit")
+			os.Exit(0)
 		}
-
-
+		time.Sleep(time.Second)
 	}
 
 }
