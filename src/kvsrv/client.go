@@ -7,6 +7,7 @@ import "math/big"
 
 type Clerk struct {
 	server *labrpc.ClientEnd
+	ClientId int64
 	// You will have to modify this struct.
 }
 
@@ -20,6 +21,7 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
+	ck.ClientId = nrand()
 	// You'll have to add code here.
 	return ck
 }
@@ -37,9 +39,17 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{
 		Key: key,
+		RequestId: nrand(),
+		ClientId: ck.ClientId,
+	}
+	report_args := ReportArgs{
+		RequestId: args.RequestId,
+		ClientId: args.ClientId,
 	}
 	reply := GetReply{}
-	ck.server.Call("KVServer.Get", &args, &reply)
+	report_reply := ReportReply{}
+	for !ck.server.Call("KVServer.Get", &args, &reply) {}
+	for !ck.server.Call("KVServer.Report", &report_args, &report_reply) {}
 	return reply.Value
 	// You will have to modify this function.
 }
@@ -57,15 +67,22 @@ func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	args := PutAppendArgs{
 		Key: key,
 		Value: value,
+		RequestId: nrand(),
+		ClientId: ck.ClientId,
 	}
-
+	report_args := ReportArgs{
+		RequestId: args.RequestId,
+		ClientId: args.ClientId,
+	}
 	reply := PutAppendReply{}
+	report_reply := ReportReply{}
 	if op == "Put" {
-        ck.server.Call("KVServer.Put", &args, &reply)
+        for !ck.server.Call("KVServer.Put", &args, &reply) {}
 	} else if op == "Append" {
-		ck.server.Call("KVServer.Append", &args, &reply)
+		for !ck.server.Call("KVServer.Append", &args, &reply) {}
 	}
 
+	for !ck.server.Call("KVServer.Report", &report_args, &report_reply) {}
 	return reply.Value
 }
 
